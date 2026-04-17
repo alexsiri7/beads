@@ -75,10 +75,6 @@ var doltShowCmd = &cobra.Command{
 	Use:   "show",
 	Short: "Show current Dolt configuration with connection status",
 	Run: func(cmd *cobra.Command, args []string) {
-		if isEmbeddedMode() {
-			fmt.Fprintln(os.Stderr, "Error: 'bd dolt show' is not supported in embedded mode (no Dolt server)")
-			os.Exit(1)
-		}
 		showDoltConfig(true)
 	},
 }
@@ -411,18 +407,20 @@ on the next bd command unless auto-start is disabled.`,
 
 var doltStatusCmd = &cobra.Command{
 	Use:   "status",
-	Short: "Show Dolt server status",
-	Long: `Show the status of the dolt sql-server for the current project.
+	Short: "Show Dolt engine status",
+	Long: `Show the status of the Dolt engine for the current project.
 
-Displays whether the server is running, its PID, port, and data directory.`,
+In server mode, reports whether the dolt sql-server is running, its PID, port,
+and data directory. In embedded mode, reports that the Dolt engine runs
+in-process and shows the on-disk data directory.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		if isEmbeddedMode() {
-			fmt.Fprintln(os.Stderr, "Error: 'bd dolt status' is not supported in embedded mode (no Dolt server)")
-			os.Exit(1)
-		}
 		beadsDir := selectedDoltBeadsDir()
 		if beadsDir == "" {
 			FatalErrorWithHint(activeWorkspaceNotFoundError(), diagHint())
+		}
+		if isEmbeddedMode() {
+			showEmbeddedDoltStatus(beadsDir)
+			return
 		}
 		serverDir := doltserver.ResolveServerDir(beadsDir)
 
@@ -453,6 +451,33 @@ Displays whether the server is running, its PID, port, and data directory.`,
 			fmt.Println("  Mode: shared server")
 		}
 	},
+}
+
+// showEmbeddedDoltStatus reports Dolt engine status when running in
+// embedded mode. There is no separate server process; the engine runs
+// in-process and data lives at .beads/embeddeddolt/.
+func showEmbeddedDoltStatus(beadsDir string) {
+	dataDir := filepath.Join(beadsDir, "embeddeddolt")
+	dataDirExists := false
+	if info, err := os.Stat(dataDir); err == nil && info.IsDir() {
+		dataDirExists = true
+	}
+
+	if jsonOutput {
+		outputJSON(map[string]interface{}{
+			"mode":            "embedded",
+			"running":         false,
+			"data_dir":        dataDir,
+			"data_dir_exists": dataDirExists,
+		})
+		return
+	}
+
+	fmt.Println("Dolt engine: embedded (in-process, no server)")
+	fmt.Printf("  Data: %s\n", dataDir)
+	if !dataDirExists {
+		fmt.Printf("  %s\n", ui.RenderWarn("Data directory does not exist — run 'bd init' to create it"))
+	}
 }
 
 var doltKillallCmd = &cobra.Command{
@@ -1048,11 +1073,13 @@ func showDoltConfig(testConnection bool) {
 	}
 
 	backend := cfg.GetBackend()
+	embedded := isEmbeddedMode()
 
 	// Resolve actual server port for connection testing
 	showHost := cfg.GetDoltServerHost()
 	dsCfg := doltserver.DefaultConfig(beadsDir)
 	showPort := dsCfg.Port
+	embeddedDataDir := filepath.Join(beadsDir, "embeddeddolt")
 
 	if jsonOutput {
 		result := map[string]interface{}{
@@ -1060,12 +1087,17 @@ func showDoltConfig(testConnection bool) {
 		}
 		if backend == configfile.BackendDolt {
 			result["database"] = cfg.GetDoltDatabase()
-			result["host"] = showHost
-			result["port"] = showPort
-			result["user"] = cfg.GetDoltServerUser()
-			result["shared_server"] = doltserver.IsSharedServerMode()
-			if testConnection {
-				result["connection_ok"] = testServerConnection(showHost, showPort)
+			result["embedded"] = embedded
+			if embedded {
+				result["data_dir"] = embeddedDataDir
+			} else {
+				result["host"] = showHost
+				result["port"] = showPort
+				result["user"] = cfg.GetDoltServerUser()
+				result["shared_server"] = doltserver.IsSharedServerMode()
+				if testConnection {
+					result["connection_ok"] = testServerConnection(showHost, showPort)
+				}
 			}
 		}
 		outputJSON(result)
@@ -1080,31 +1112,40 @@ func showDoltConfig(testConnection bool) {
 	fmt.Println("Dolt Configuration")
 	fmt.Println("==================")
 	fmt.Printf("  Database: %s\n", cfg.GetDoltDatabase())
-	fmt.Printf("  Host:     %s\n", showHost)
-	fmt.Printf("  Port:     %d\n", showPort)
-	fmt.Printf("  User:     %s\n", cfg.GetDoltServerUser())
-	if doltserver.IsSharedServerMode() {
-		fmt.Println("  Mode:     shared server")
-		if sharedDir, err := doltserver.SharedServerDir(); err == nil {
-			fmt.Printf("  Server:   %s\n", sharedDir)
-		}
+	if embedded {
+		fmt.Println("  Mode:     embedded (in-process Dolt engine)")
+		fmt.Printf("  Data:     %s\n", embeddedDataDir)
 	} else {
-		fmt.Println("  Mode:     per-project")
-	}
-
-	if testConnection {
-		fmt.Println()
-		if testServerConnection(showHost, showPort) {
-			fmt.Printf("  %s\n", ui.RenderPass("✓ Server connection OK"))
+		fmt.Printf("  Host:     %s\n", showHost)
+		fmt.Printf("  Port:     %d\n", showPort)
+		fmt.Printf("  User:     %s\n", cfg.GetDoltServerUser())
+		if doltserver.IsSharedServerMode() {
+			fmt.Println("  Mode:     shared server")
+			if sharedDir, err := doltserver.SharedServerDir(); err == nil {
+				fmt.Printf("  Server:   %s\n", sharedDir)
+			}
 		} else {
-			fmt.Printf("  %s\n", ui.RenderWarn("✗ Server not reachable"))
+			fmt.Println("  Mode:     per-project")
+		}
+
+		if testConnection {
+			fmt.Println()
+			if testServerConnection(showHost, showPort) {
+				fmt.Printf("  %s\n", ui.RenderPass("✓ Server connection OK"))
+			} else {
+				fmt.Printf("  %s\n", ui.RenderWarn("✗ Server not reachable"))
+			}
 		}
 	}
 
 	// Show remotes from both surfaces
-	doltDir := doltserver.ResolveDoltDir(beadsDir)
 	dbName := cfg.GetDoltDatabase()
-	dbDir := filepath.Join(doltDir, dbName)
+	var dbDir string
+	if embedded {
+		dbDir = filepath.Join(embeddedDataDir, dbName)
+	} else {
+		dbDir = filepath.Join(doltserver.ResolveDoltDir(beadsDir), dbName)
+	}
 	fmt.Println("\nRemotes:")
 	ctx := context.Background()
 	st := getStore()
